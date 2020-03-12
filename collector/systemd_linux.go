@@ -17,6 +17,7 @@ package collector
 
 import (
 	"fmt"
+	"io/ioutil"
 	"math"
 	"regexp"
 	"strconv"
@@ -45,6 +46,7 @@ var (
 	enableTaskMetrics      = kingpin.Flag("collector.systemd.enable-task-metrics", "Enables service unit tasks metrics unit_tasks_current and unit_tasks_max").Bool()
 	enableRestartsMetrics  = kingpin.Flag("collector.systemd.enable-restarts-metrics", "Enables service unit metric service_restart_total").Bool()
 	enableStartTimeMetrics = kingpin.Flag("collector.systemd.enable-start-time-metrics", "Enables service unit metric unit_start_time_seconds").Bool()
+	enableCoreDumpMetrics  = kingpin.Flag("collector.systemd.enable-core-dump-metrics", "Enables core dump metric core_dump_total").Bool()
 )
 
 type systemdCollector struct {
@@ -60,6 +62,7 @@ type systemdCollector struct {
 	socketCurrentConnectionsDesc  *prometheus.Desc
 	socketRefusedConnectionsDesc  *prometheus.Desc
 	systemdVersionDesc            *prometheus.Desc
+	coreDumpDesc                  *prometheus.Desc
 	systemdVersion                int
 	unitWhitelistPattern          *regexp.Regexp
 	unitBlacklistPattern          *regexp.Regexp
@@ -118,6 +121,9 @@ func NewSystemdCollector(logger log.Logger) (Collector, error) {
 	systemdVersionDesc := prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, subsystem, "version"),
 		"Detected systemd version", []string{}, nil)
+	coreDumpDesc := prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, subsystem, "core_dump_total"),
+		"Core dump count for processes.", []string{"name"}, nil)
 	unitWhitelistPattern := regexp.MustCompile(fmt.Sprintf("^(?:%s)$", *unitWhitelist))
 	unitBlacklistPattern := regexp.MustCompile(fmt.Sprintf("^(?:%s)$", *unitBlacklist))
 
@@ -139,6 +145,7 @@ func NewSystemdCollector(logger log.Logger) (Collector, error) {
 		socketAcceptedConnectionsDesc: socketAcceptedConnectionsDesc,
 		socketCurrentConnectionsDesc:  socketCurrentConnectionsDesc,
 		socketRefusedConnectionsDesc:  socketRefusedConnectionsDesc,
+		coreDumpDesc:                  coreDumpDesc,
 		systemdVersionDesc:            systemdVersionDesc,
 		systemdVersion:                systemdVersion,
 		unitWhitelistPattern:          unitWhitelistPattern,
@@ -182,6 +189,16 @@ func (c *systemdCollector) Update(ch chan<- prometheus.Metric) error {
 		c.collectUnitStatusMetrics(conn, ch, units)
 		level.Debug(c.logger).Log("msg", "collectUnitStatusMetrics took", "duration_seconds", time.Since(begin).Seconds())
 	}()
+
+	if *enableCoreDumpMetrics {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			begin = time.Now()
+			c.collectCoreDumpMetrics(ch)
+			level.Debug(c.logger).Log("msg", "collectCoreDumpMetrics took", "duration_seconds", time.Since(begin).Seconds())
+		}()
+	}
 
 	if *enableStartTimeMetrics {
 		wg.Add(1)
@@ -270,6 +287,32 @@ func (c *systemdCollector) collectUnitStatusMetrics(conn *dbus.Conn, ch chan<- p
 					c.nRestartsDesc, prometheus.CounterValue,
 					float64(restartsCount.Value.Value().(uint32)), unit.Name)
 			}
+		}
+	}
+}
+
+func (c *systemdCollector) collectCoreDumpMetrics(ch chan<- prometheus.Metric) {
+	systemdCoreDumpDir := "/var/lib/systemd/coredump/"
+	files, err := ioutil.ReadDir(systemdCoreDumpDir)
+	if err != nil {
+		level.Debug(c.logger).Log("msg", "couldn't read files from coredump directory %q: %v", systemdCoreDumpDir, err)
+		return
+	}
+	coredumpInfo := make(map[string]uint32)
+	for _, f := range files {
+		fparts := strings.Split(f.Name(), ".")
+		if len(fparts) < 2 {
+			level.Debug(c.logger).Log("msg", "core file name not in the expected format: %q", f.Name())
+			continue
+		}
+		if fparts[0] == "core" {
+			v, ok := coredumpInfo[fparts[1]]
+			if !ok {
+				coredumpInfo[fparts[1]] = 1
+			} else {
+				coredumpInfo[fparts[1]] = v + 1
+			}
+			ch <- prometheus.MustNewConstMetric(c.coreDumpDesc, prometheus.GaugeValue, float64(v), fparts[1])
 		}
 	}
 }
